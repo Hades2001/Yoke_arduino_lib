@@ -15,8 +15,8 @@ public:
     Yoke_moto_a(void) : ryzobee_yoke(kRYZOBEE_YOKE_F_BUS) {
     }
 
-    // dir: DIR_FORWARD(0) 正转，DIR_REVERSE(1) 反转
-    // speed: 0 停止，100 全速
+    // dir: DIR_FORWARD(0) forward, DIR_REVERSE(1) reverse
+    // speed: 0 stopped, 100 full speed
     void setmoto(uint8_t dir, uint8_t speed) {
         if (!_initialized) {
             YOKE_I_PRINTF("Port is not initialized.\n");
@@ -110,7 +110,7 @@ protected:
     }
 
 private:
-    // Rootmaker F-BUS 向量从 F_BUS9 开始。
+    // The RootMaker F-BUS vector starts at F_BUS9.
     static constexpr size_t F_BUS17_PIN_OFFSET = 17 - 9;
     static constexpr size_t F_BUS19_PIN_OFFSET = 19 - 9;
     static constexpr size_t F_BUS17_VECTOR_INDEX =
@@ -120,7 +120,7 @@ private:
     static constexpr uint32_t PWM_FREQUENCY_HZ = 20000;
 
 #if defined(ARDUINO_ARCH_ESP32)
-    // TIMER_1 与 RS Port 版 MOTO 使用的 TIMER_0 分离，可同时工作。
+    // TIMER_1 is separate from TIMER_0 used by the RS-port MOTO, allowing concurrent operation.
     mcpwm_unit_t _unit = MCPWM_UNIT_0;
     mcpwm_timer_t _timer = MCPWM_TIMER_1;
     gpio_num_t _pin_a = GPIO_NUM_NC;

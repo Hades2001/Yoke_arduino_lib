@@ -35,7 +35,7 @@ public:
         return getKey() & KEY_MISSED_COUNT_MASK;
     }
 
-    // 返回值单位为 0.1 秒。
+    // The return value is in units of 0.1 seconds.
     uint8_t getKeyPressedTime() {
         uint8_t value = 0;
         readRegister(REG_KEY_PRESSED_TIME, value);
@@ -49,7 +49,7 @@ public:
             : 0;
     }
 
-    // 读取低字节后，模块会自动清零 DIFF。
+    // The module automatically clears DIFF after the low byte is read.
     int16_t getDiff() {
         uint16_t value = 0;
         return _readInt16(REG_DIFF_HIGH, value)
@@ -93,7 +93,7 @@ public:
         return value;
     }
 
-    // 新地址写入 Flash，模块复位后生效。合法范围为 0x70~0x77。
+    // The new address is written to Flash and takes effect after module reset. Valid range: 0x70-0x77.
     bool setI2CAddress(uint8_t address) {
         if (address < 0x70 || address > 0x77) {
             return false;

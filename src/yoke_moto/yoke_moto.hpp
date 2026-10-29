@@ -15,8 +15,8 @@ public:
     Yoke_moto(void) : ryzobee_yoke(kRYZOBEE_YOKE_RS) {
     }
 
-    // dir: DIR_FORWARD(0) 正转，DIR_REVERSE(1) 反转
-    // speed: 0 停止，100 全速
+    // dir: DIR_FORWARD(0) forward, DIR_REVERSE(1) reverse
+    // speed: 0 stopped, 100 full speed
     void setmoto(uint8_t dir, uint8_t speed) {
         if (!_initialized) {
             YOKE_I_PRINTF("Port is not initialized.\n");

@@ -93,7 +93,7 @@ typedef struct {
 
 typedef struct {
     uint8_t  obj_num;
-    Rad60_TargetInfo_t obj[2];
+    Rad60_TargetInfo_t obj[1];  // Cache only the first target in report order.
 } Rad60_MultiTargetInfo_t;
 
 // =============================================================================
@@ -131,22 +131,22 @@ public:
     bool isDetected() const { return _is_detected; }
     uint8_t getTargetCount() const { return _multi_target.obj_num; }
 
-    uint16_t getTargetDistance(uint8_t index) const {
+    uint16_t getTargetDistance(uint8_t index = 0) const {
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].range_val;
     }
 
-    int16_t getTargetAngle(uint8_t index) const {
+    int16_t getTargetAngle(uint8_t index = 0) const {
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].angle_val;
     }
 
-    int16_t getTargetVelocity(uint8_t index) const {
+    int16_t getTargetVelocity(uint8_t index = 0) const {
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].velo_val;
     }
 
-    uint8_t getTargetID(uint8_t index) const {
+    uint8_t getTargetID(uint8_t index = 0) const {
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].objid;
     }
@@ -607,33 +607,37 @@ private:
     }
 
     // ====================================================================
-    //   Multi-target detection parser (type=0x0A)
+    //   Single-target cache from multi-target reports (type=0x0A)
     //
-    //   Data: [0]=obj_num, [1..3]=reserved, [4+]=per-target 4 bytes
-    //   Range: raw<32 → *6.25, raw>=32 → *6.85 (cm)
+    //   Data: count + 3 reserved bytes + count * 8-byte records.
+    //   Distance: cm; angle: degrees; velocity: cm/s; little-endian.
     // ====================================================================
 
+    /**
+     * @brief Validate a multi-target report and save only the first target in report order.
+     *
+     * @param len Data length, excluding the TYPE byte.
+     * @param data Report data; must not be null. Ignore incomplete frames or counts above the target limit.
+     */
     void _processMultiTargetInfo(uint8_t len, uint8_t* data) {
-        if (len < 4) return;
+        if (data == nullptr || len < 4) return;
         uint8_t obj_num = data[0];
-        if (obj_num > 2) obj_num = 2;
-        _multi_target.obj_num = obj_num;
+        if (obj_num > 3 || len < 4 + obj_num * 8) return;
 
-        for (uint8_t i = 0; i < obj_num; i++) {
-            uint8_t offset = 4 + i * 4;
-            if (offset + 3 >= len) break;
-            uint8_t raw_range = data[offset];
-            if (raw_range < 32) {
-                _multi_target.obj[i].range_val = (uint16_t)(raw_range * 6.25f);
-            } else {
-                _multi_target.obj[i].range_val = (uint16_t)(raw_range * 6.85f);
-            }
-            _multi_target.obj[i].angle_val = (int8_t)data[offset + 1];
-            _multi_target.obj[i].velo_val  = (int8_t)(data[offset + 2] / 32);
-            _multi_target.obj[i].objid     = data[offset + 3];
-        }
+        memset(&_multi_target, 0, sizeof(_multi_target));
         _is_detected = (obj_num > 0);
+        if (!_is_detected) return;
+
+        const uint8_t* target = data + 4;
+        _multi_target.obj[0].range_val = (uint16_t)target[0] | ((uint16_t)target[1] << 8);
+        uint16_t angle = (uint16_t)target[2] | ((uint16_t)target[3] << 8);
+        uint16_t velocity = (uint16_t)target[4] | ((uint16_t)target[5] << 8);
+        _multi_target.obj[0].angle_val = (int16_t)((angle & 0x8000) ? (int32_t)angle - 0x10000 : angle);
+        _multi_target.obj[0].velo_val = (int16_t)((velocity & 0x8000) ? (int32_t)velocity - 0x10000 : velocity);
+        _multi_target.obj[0].objid = target[6];
+        _multi_target.obj_num = 1;
     }
+
 };
 
 #else
@@ -646,10 +650,10 @@ public:
     bool isConnected() const { return false; }
     bool isDetected() const { return false; }
     uint8_t getTargetCount() const { return 0; }
-    uint16_t getTargetDistance(uint8_t i) const { return 0; }
-    int16_t getTargetAngle(uint8_t i) const { return 0; }
-    int16_t getTargetVelocity(uint8_t i) const { return 0; }
-    uint8_t getTargetID(uint8_t i) const { return 0; }
+    uint16_t getTargetDistance(uint8_t i = 0) const { return 0; }
+    int16_t getTargetAngle(uint8_t i = 0) const { return 0; }
+    int16_t getTargetVelocity(uint8_t i = 0) const { return 0; }
+    uint8_t getTargetID(uint8_t i = 0) const { return 0; }
     bool setMotionNear(uint16_t d) { return false; }
     bool setMotionFar(uint16_t d) { return false; }
     bool setMotionSensitivity(uint8_t s) { return false; }
