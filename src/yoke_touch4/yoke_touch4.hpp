@@ -9,6 +9,14 @@
 #include "driver/gpio.h"
 #endif
 
+struct Touch4Config {
+    bool swap_tx_rx = true;  // Verified TOUCH4 wiring: second RS pin is host TX.
+    uint8_t enabled_channels = 0x0F;
+    uint32_t startup_delay_ms = 500;
+    uint32_t poll_interval_ms = 100;  // Zero disables automatic polling.
+    uint32_t timeout_ms = 1000;
+};
+
 // SC92F837x four-channel capacitive touch module; UART firmware from mian.c.
 class Yoke_touch4 : public ryzobee_yoke {
 public:
@@ -26,38 +34,51 @@ public:
     }
 
     /**
-     * @brief Initialize UART on an RS port (first pin TX, second pin RX).
+     * @brief Initialize UART, verify firmware communication, and enable channels.
      *
-     * @param iodata Board port data; must remain valid until end().
+     * @param iodata RS port description; never modified except for its reservation flag.
+     * @param config Wiring, startup, channel, and polling settings.
      * @return YOKE_PORT_ERROR_NONE on success, otherwise a port error code.
      */
-    int begin(std::vector<uint8_t>* iodata) {
+    int begin(std::vector<uint8_t>* iodata, const Touch4Config& config = Touch4Config()) {
         if (_initialized) return YOKE_PORT_ERROR_ALREADY_INITIALIZED;
-        if (iodata == nullptr || iodata->size() < YOKE_PORT_PIN_START + 2) {
+        if (config.enabled_channels > 0x0F || config.timeout_ms == 0) {
             return YOKE_PORT_ERROR_NOT_CONFIGURED;
         }
-        if (portInvalid(iodata)) return YOKE_PORT_ERROR_INVALID;
-        int result = portBegin(iodata);
-        if (result == YOKE_PORT_ERROR_NONE) {
-            _iodata = iodata;
-            _iodata->at(YOKE_PORT_USED) = 1;
-        }
-        return result;
+        _config = config;
+        return ryzobee_yoke::begin(iodata);
     }
 
     /**
-     * @brief Release the owned UART driver and RS port.
-     *
-     * @return YOKE_PORT_ERROR_NONE on success, otherwise a port error code.
+     * @brief Poll at the configured interval; may block up to timeout_ms for a reply.
      */
-    int end() {
-        int result = portEnd();
-        if (result == YOKE_PORT_ERROR_NONE) {
-            _iodata->at(YOKE_PORT_USED) = 0;
-            _iodata = nullptr;
+    void update() {
+        if (!_initialized) return;
+        _receive();
+        if (!_waiting && _config.poll_interval_ms != 0 &&
+            millis() - _last_poll_ms >= _config.poll_interval_ms) {
+            readData(_config.timeout_ms);
         }
-        return result;
     }
+
+    bool isConnected() const { return _initialized && _connected; }
+    uint16_t getFirmwareVersion() const { return _version; }
+
+    /**
+     * @brief Consume a latched press event; repeated presses coalesce until consumed.
+     *
+     * @param channel Logical channel index, 0-3.
+     * @return Whether a press event was pending for this channel.
+     */
+    bool wasPressed(uint8_t channel) { return _consumeEvent(_pressed_events, channel); }
+
+    /**
+     * @brief Consume a latched release event; repeated releases coalesce until consumed.
+     *
+     * @param channel Logical channel index, 0-3.
+     * @return Whether a release event was pending for this channel.
+     */
+    bool wasReleased(uint8_t channel) { return _consumeEvent(_released_events, channel); }
 
     /**
      * @brief Enable raw UART tracing on a separate console stream.
@@ -67,28 +88,6 @@ public:
     void setDebugStream(Stream* stream) { _debug = stream; }
 
     /**
-     * @brief Drain UART input without blocking and parse complete CRC-checked frames.
-     */
-    void update() {
-#if defined(ARDUINO_ARCH_ESP32)
-        if (!_initialized) return;
-        if (_state != WAIT_AA && millis() - _last_byte_ms > FRAME_TIMEOUT_MS) {
-            _state = WAIT_AA;
-        }
-        uint8_t byte;
-        while (uart_read_bytes(_uart_num, &byte, 1, 0) == 1) {
-            if (_debug != nullptr) {
-                _debug->print("TOUCH4 RX: ");
-                if (byte < 0x10) _debug->print('0');
-                _debug->println(byte, HEX);
-            }
-            _processByte(byte);
-            _last_byte_ms = millis();
-        }
-#endif
-    }
-
-    /**
      * @brief Request and cache all four touch states and raw values.
      *
      * @param timeout_ms Maximum response wait in milliseconds.
@@ -96,7 +95,12 @@ public:
      */
     bool readData(uint32_t timeout_ms = COMMAND_TIMEOUT_MS) {
         uint8_t unused = 0;
-        return _transact(0x21, &unused, 1, 0x11, 9, timeout_ms);
+        bool ready = _transact(0x21, &unused, 1, 0x11, 9, timeout_ms);
+        if (_initialized) {
+            _connected = ready;
+            _last_poll_ms = millis();
+        }
+        return ready;
     }
 
     uint8_t getTouchMask() const { return _touch_mask; }
@@ -130,7 +134,7 @@ public:
      */
     bool setEnabledChannels(uint8_t mask) {
         if (mask > 0x0F) return false;
-        return _transact(0x22, &mask, 1, 0x12, 1, COMMAND_TIMEOUT_MS) && _response[0] == mask;
+        return _transact(0x22, &mask, 1, 0x12, 1, _config.timeout_ms) && _response[0] == mask;
     }
 
     /**
@@ -141,7 +145,7 @@ public:
      */
     bool setThresholds(const uint8_t* data) {
         if (data == nullptr) return false;
-        return _transact(0x23, data, 8, 0x13, 1, COMMAND_TIMEOUT_MS) && _response[0] == 1;
+        return _transact(0x23, data, 8, 0x13, 1, _config.timeout_ms) && _response[0] == 1;
     }
 
     /**
@@ -151,7 +155,7 @@ public:
      */
     bool reconfigure() {
         uint8_t unused = 0;
-        return _transact(0x24, &unused, 1, 0x14, 1, COMMAND_TIMEOUT_MS) && _response[0] == 1;
+        return _transact(0x24, &unused, 1, 0x14, 1, _config.timeout_ms) && _response[0] == 1;
     }
 
     /**
@@ -163,7 +167,7 @@ public:
      */
     bool getChannelConfig(uint8_t channel, uint8_t* data) {
         if (channel >= CHANNEL_COUNT || data == nullptr) return false;
-        if (!_transact(0x25, &channel, 1, 0x15, 8, COMMAND_TIMEOUT_MS)) return false;
+        if (!_transact(0x25, &channel, 1, 0x15, 8, _config.timeout_ms)) return false;
         memcpy(data, _response, 8);
         return true;
     }
@@ -180,7 +184,7 @@ public:
         uint8_t payload[9];
         payload[0] = channel;
         memcpy(payload + 1, data, 8);
-        return _transact(0x26, payload, 9, 0x16, 1, COMMAND_TIMEOUT_MS) &&
+        return _transact(0x26, payload, 9, 0x16, 1, _config.timeout_ms) &&
                _response[0] == (1 | (channel << 4));
     }
 
@@ -193,7 +197,7 @@ public:
     bool getVersion(uint16_t* version) {
         if (version == nullptr) return false;
         uint8_t unused = 0;
-        if (!_transact(0x2F, &unused, 1, 0x1F, 2, COMMAND_TIMEOUT_MS)) return false;
+        if (!_transact(0x2F, &unused, 1, 0x1F, 2, _config.timeout_ms)) return false;
         *version = ((uint16_t)_response[0] << 8) | _response[1];
         return true;
     }
@@ -208,8 +212,8 @@ protected:
             return YOKE_PORT_ERROR_NOT_CONFIGURED;
         }
 #if defined(ARDUINO_ARCH_ESP32)
-        int tx = iodata->at(YOKE_PORT_PIN_START);
-        int rx = iodata->at(YOKE_PORT_PIN_START + 1);
+        int tx = iodata->at(YOKE_PORT_PIN_START + (_config.swap_tx_rx ? 1 : 0));
+        int rx = iodata->at(YOKE_PORT_PIN_START + (_config.swap_tx_rx ? 0 : 1));
         if (!GPIO_IS_VALID_OUTPUT_GPIO(tx) || !GPIO_IS_VALID_GPIO(rx) || tx == rx) {
             return YOKE_PORT_ERROR_NOT_CONFIGURED;
         }
@@ -236,7 +240,18 @@ protected:
         _has_data = false;
         _touch_mask = 0;
         memset(_raw, 0, sizeof(_raw));
+        _pressed_events = 0;
+        _released_events = 0;
+        _connected = false;
+        _version = 0;
         _initialized = true;
+        delay(_config.startup_delay_ms);
+        if (!getVersion(&_version) || !setEnabledChannels(_config.enabled_channels)) {
+            portEnd();
+            return YOKE_PORT_ERROR_NOT_AVAILABLE;
+        }
+        _connected = true;
+        _last_poll_ms = millis();
         return YOKE_PORT_ERROR_NONE;
 #else
         return YOKE_PORT_ERROR_NOT_SUPPORTED;
@@ -249,6 +264,10 @@ protected:
         if (uart_driver_delete(_uart_num) != ESP_OK) return YOKE_PORT_ERROR_NOT_AVAILABLE;
 #endif
         _initialized = false;
+        _connected = false;
+        _version = 0;
+        _pressed_events = 0;
+        _released_events = 0;
         _waiting = false;
         _has_data = false;
         _touch_mask = 0;
@@ -258,6 +277,28 @@ protected:
     }
 
 private:
+    /**
+     * @brief Drain UART input without blocking and parse complete CRC-checked frames.
+     */
+    void _receive() {
+#if defined(ARDUINO_ARCH_ESP32)
+        if (!_initialized) return;
+        if (_state != WAIT_AA && millis() - _last_byte_ms > FRAME_TIMEOUT_MS) {
+            _state = WAIT_AA;
+        }
+        uint8_t byte;
+        while (uart_read_bytes(_uart_num, &byte, 1, 0) == 1) {
+            if (_debug != nullptr) {
+                _debug->print("TOUCH4 RX: ");
+                if (byte < 0x10) _debug->print('0');
+                _debug->println(byte, HEX);
+            }
+            _processByte(byte);
+            _last_byte_ms = millis();
+        }
+#endif
+    }
+
     enum ParseState { WAIT_AA, WAIT_55, WAIT_CMD, WAIT_LEN, WAIT_DATA, WAIT_CRC, WAIT_END };
     static constexpr uint32_t FRAME_TIMEOUT_MS = 100;
 
@@ -281,7 +322,7 @@ private:
 #if defined(ARDUINO_ARCH_ESP32)
         if (!_initialized || _waiting || data == nullptr || len == 0 || len > 9) return false;
         // Firmware has no sequence number: serialize requests and drain earlier replies.
-        update();
+        _receive();
         _state = WAIT_AA;
         uint8_t frame[15] = {0xAA, 0x55, cmd, len};
         memcpy(frame + 4, data, len);
@@ -308,7 +349,7 @@ private:
         }
         uint32_t start = millis();
         while (!_received && millis() - start < timeout_ms) {
-            update();
+            _receive();
             if (!_received) delay(1);
         }
         _waiting = false;
@@ -361,7 +402,11 @@ private:
             _debug->println(_len);
         }
         if (_cmd == 0x11 && _len == 9) {
-            _touch_mask = _data[0] & 0x0F;
+            uint8_t mask = _data[0] & 0x0F;
+            uint8_t changed = mask ^ _touch_mask;
+            _pressed_events |= changed & mask;
+            _released_events |= changed & _touch_mask;
+            _touch_mask = mask;
             for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
                 _raw[i] = ((uint16_t)_data[1 + i * 2] << 8) | _data[2 + i * 2];
             }
@@ -379,6 +424,19 @@ private:
 #else
     int _uart_num;
 #endif
+    static bool _consumeEvent(uint8_t& events, uint8_t channel) {
+        if (channel >= CHANNEL_COUNT) return false;
+        uint8_t bit = 1U << channel;
+        bool pending = (events & bit) != 0;
+        events &= static_cast<uint8_t>(~bit);
+        return pending;
+    }
+
+    Touch4Config _config;
+    uint32_t _last_poll_ms = 0;
+    uint16_t _version = 0;
+    uint8_t _pressed_events = 0, _released_events = 0;
+    bool _connected = false;
     Stream* _debug = nullptr;
     ParseState _state = WAIT_AA;
     uint32_t _last_byte_ms = 0;

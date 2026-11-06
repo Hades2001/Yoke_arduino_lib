@@ -4,6 +4,7 @@
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -117,10 +118,23 @@ class Yoke_rad60 : public ryzobee_yoke {
 public:
     explicit Yoke_rad60(uart_port_t uart_num = UART_NUM_1,
                         uint32_t baudrate = RAD60_DEFAULT_BAUDRATE)
-        : ryzobee_yoke(kRYZOBEE_YOKE_RS),
+        : ryzobee_yoke(kRYZOBEE_YOKE_RS, kRS_BUS_UART),
           _uart_num(uart_num), _baudrate(baudrate) {
         memset(&_multi_target, 0, sizeof(_multi_target));
         memset(_tmp_buf, 0, sizeof(_tmp_buf));
+    }
+
+    /**
+     * @brief Initialize UART, wait for startup, and verify radar communication.
+     *
+     * @param iodata RS port description; must remain valid until end().
+     * @param apply_defaults Whether to apply the default detection settings without saving to flash.
+     * @return YOKE_PORT_ERROR_NONE on success, otherwise a port error code.
+     */
+    int begin(std::vector<uint8_t>* iodata, bool apply_defaults = true) {
+        if (_initialized) return YOKE_PORT_ERROR_ALREADY_INITIALIZED;
+        _apply_defaults = apply_defaults;
+        return ryzobee_yoke::begin(iodata);
     }
 
     // ====================================================================
@@ -172,7 +186,7 @@ public:
             _is_detected = false;
             _multi_target.obj_num = 0;
 
-            if (!_query_sent && (now - _last_query_ms > RAD60_QUERY_INTERVAL_MS)) {
+            if (!_waiting_resp && !_query_sent && (now - _last_query_ms > RAD60_QUERY_INTERVAL_MS)) {
                 _sendCommand(CMD_GET_RADAR_STATE, nullptr, 0);
                 _last_query_ms = now;
                 _query_sent = true;
@@ -319,6 +333,16 @@ protected:
             return YOKE_PORT_ERROR_ALREADY_INITIALIZED;
         }
 
+        if (_uart_num < UART_NUM_0 || _uart_num >= UART_NUM_MAX ||
+            uart_is_driver_installed(_uart_num)) {
+            return YOKE_PORT_ERROR_NOT_AVAILABLE;
+        }
+        if (!GPIO_IS_VALID_OUTPUT_GPIO(iodata->at(YOKE_PORT_PIN_START)) ||
+            !GPIO_IS_VALID_GPIO(iodata->at(YOKE_PORT_PIN_START + 1)) ||
+            iodata->at(YOKE_PORT_PIN_START) == iodata->at(YOKE_PORT_PIN_START + 1)) {
+            return YOKE_PORT_ERROR_NOT_CONFIGURED;
+        }
+
         _tx_pin = iodata->at(YOKE_PORT_PIN_START);      // SDA → TX
         _rx_pin = iodata->at(YOKE_PORT_PIN_START + 1);  // SCL → RX
 
@@ -361,6 +385,21 @@ protected:
         _raw_byte_total = 0;
         _initialized    = true;
 
+        // Allow the module to boot before sending its first command.
+        delay(2000);
+        bool ready = enterCommunicationMode(true);
+        delay(200);
+        uint8_t state = 0;
+        ready = ready && getRadarState(&state);
+        if (ready && _apply_defaults) {
+            ready = applyDefaultConfig();
+        }
+        if (!ready) {
+            portEnd();
+            return YOKE_PORT_ERROR_NOT_AVAILABLE;
+        }
+        _is_comm_ok = true;
+        _last_data_ms = millis();
         return YOKE_PORT_ERROR_NONE;
     }
 
@@ -392,7 +431,8 @@ private:
     //   Radar data cache
     // ====================================================================
 
-    bool                    _is_comm_ok = true;
+    bool                    _is_comm_ok = false;
+    bool                    _apply_defaults = true;
     bool                    _is_detected = false;
     Rad60_MultiTargetInfo_t _multi_target;
 
@@ -645,7 +685,10 @@ private:
 class Yoke_rad60 : public ryzobee_yoke {
 public:
     Yoke_rad60(int uart_num = 0, uint32_t baudrate = 115200)
-        : ryzobee_yoke(kRYZOBEE_YOKE_RS) {}
+        : ryzobee_yoke(kRYZOBEE_YOKE_RS, kRS_BUS_UART) {}
+    int begin(std::vector<uint8_t>* iodata, bool apply_defaults = true) {
+        return ryzobee_yoke::begin(iodata);
+    }
     void update() {}
     bool isConnected() const { return false; }
     bool isDetected() const { return false; }
