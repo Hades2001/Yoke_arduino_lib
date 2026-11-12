@@ -1,10 +1,13 @@
 #pragma once
 
+#include <Arduino.h>
 #include "../ryzobee_yoke.hpp"
+#include "../yoke_component/yoke_uart_task.hpp"
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_idf_version.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -106,11 +109,9 @@ typedef struct {
 //   Usage:
 //     Yoke_rad60 radar(UART_NUM_1);
 //     radar.begin(board.maker.useport("rs_port4"));
-//     radar.enterCommunicationMode(true);
-//     radar.applyDefaultConfig();
-//     // In loop:
-//     radar.update();
+//     // In loop (UART is serviced by a background task by default):
 //     if (radar.isDetected()) { ... }
+//     // For manual polling, use begin(port, false) and call update().
 // =============================================================================
 
 class Yoke_rad60 : public ryzobee_yoke {
@@ -124,82 +125,81 @@ public:
         memset(_tmp_buf, 0, sizeof(_tmp_buf));
     }
 
+    ~Yoke_rad60() { if (_initialized) end(); }
+
     /**
      * @brief Initialize UART, wait for startup, and verify radar communication.
      *
      * @param iodata RS port description; must remain valid until end().
+     * @param use_task Run UART receive/query processing in a background task (default true).
      * @param apply_defaults Whether to apply the default detection settings without saving to flash.
+     * Initialization and explicit configuration commands remain synchronous.
+     * Call begin/end from the owning task, without concurrent commands.
      * @return YOKE_PORT_ERROR_NONE on success, otherwise a port error code.
      */
-    int begin(std::vector<uint8_t>* iodata, bool apply_defaults = true) {
+    int begin(std::vector<uint8_t>* iodata, bool use_task = true, bool apply_defaults = true) {
+        yoke_detail::UartTask::Lock lock(_task);
+        if (!lock) return YOKE_PORT_ERROR_NOT_AVAILABLE;
         if (_initialized) return YOKE_PORT_ERROR_ALREADY_INITIALIZED;
         _apply_defaults = apply_defaults;
-        return ryzobee_yoke::begin(iodata);
+        int result = ryzobee_yoke::begin(iodata);
+        if (result != YOKE_PORT_ERROR_NONE) return result;
+        if (use_task && !_task.start("yoke_rad60", _taskPoll, this)) {
+            ryzobee_yoke::end();
+            return YOKE_PORT_ERROR_NOT_AVAILABLE;
+        }
+        return YOKE_PORT_ERROR_NONE;
     }
 
     // ====================================================================
     //   Status queries (non-blocking, read from cache)
     // ====================================================================
 
-    bool isConnected() const { return _is_comm_ok; }
-    bool isDetected() const { return _is_detected; }
-    uint8_t getTargetCount() const { return _multi_target.obj_num; }
+    bool isConnected() const {
+        yoke_detail::CacheLock lock(_cache_mutex);
+        return _is_comm_ok;
+    }
+    bool isDetected() const {
+        yoke_detail::CacheLock lock(_cache_mutex);
+        return _is_detected;
+    }
+    uint8_t getTargetCount() const {
+        yoke_detail::CacheLock lock(_cache_mutex);
+        return _multi_target.obj_num;
+    }
 
     uint16_t getTargetDistance(uint8_t index = 0) const {
+        yoke_detail::CacheLock lock(_cache_mutex);
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].range_val;
     }
 
     int16_t getTargetAngle(uint8_t index = 0) const {
+        yoke_detail::CacheLock lock(_cache_mutex);
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].angle_val;
     }
 
     int16_t getTargetVelocity(uint8_t index = 0) const {
+        yoke_detail::CacheLock lock(_cache_mutex);
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].velo_val;
     }
 
     uint8_t getTargetID(uint8_t index = 0) const {
+        yoke_detail::CacheLock lock(_cache_mutex);
         if (index >= _multi_target.obj_num) return 0;
         return _multi_target.obj[index].objid;
     }
 
     // ====================================================================
-    //   Main update (call frequently from loop)
+    //   Manual update (call frequently from loop only when use_task=false)
     // ====================================================================
 
     void update() {
-        if (!_initialized) return;
-
-        _raw_byte_count = 0;
-        uint8_t rx_byte;
-        int len;
-        while ((len = uart_read_bytes(_uart_num, &rx_byte, 1, 0)) > 0) {
-            _raw_byte_count++;
-            _raw_byte_total++;
-            _processByte(rx_byte);
-        }
-
-        uint32_t now = millis();
-        if (now - _last_data_ms > RAD60_NO_DATA_TIMEOUT_MS) {
-            _is_detected = false;
-            _multi_target.obj_num = 0;
-
-            if (!_waiting_resp && !_query_sent && (now - _last_query_ms > RAD60_QUERY_INTERVAL_MS)) {
-                _sendCommand(CMD_GET_RADAR_STATE, nullptr, 0);
-                _last_query_ms = now;
-                _query_sent = true;
-            }
-
-            if (_query_sent && (now - _last_query_ms > RAD60_COMM_TIMEOUT_MS)) {
-                if (now - _init_time_ms > 5000) {
-                    _is_comm_ok = false;
-                }
-                _query_sent = false;
-            }
-            _last_data_ms = now;
-        }
+        if (_task.running()) return;
+        yoke_detail::UartTask::Lock lock(_task);
+        if (lock) _update();
     }
 
     // ====================================================================
@@ -298,6 +298,8 @@ public:
     }
 
     bool applyDefaultConfig() {
+        yoke_detail::UartTask::Lock lock(_task);
+        if (!lock || !_initialized) return false;
         bool ok = true;
         if (!setMotionNear(10))       { ok = false; }
         if (!setMotionFar(1000))      { ok = false; }
@@ -310,7 +312,10 @@ public:
         return ok;
     }
 
-    uint32_t getRawBytesReceived() const { return _raw_byte_count; }
+    uint32_t getRawBytesReceived() const {
+        yoke_detail::CacheLock lock(_cache_mutex);
+        return _raw_byte_count;
+    }
 
     static const char* detStatusToString(uint8_t det_result) {
         switch (det_result) {
@@ -352,7 +357,11 @@ protected:
             .parity     = UART_PARITY_DISABLE,
             .stop_bits  = UART_STOP_BITS_1,
             .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+#if ESP_IDF_VERSION_MAJOR >= 5
             .source_clk = UART_SCLK_DEFAULT,
+#else
+            .source_clk = UART_SCLK_APB,
+#endif
         };
 
         esp_err_t err = uart_param_config(_uart_num, &uart_config);
@@ -371,17 +380,14 @@ protected:
         }
 
         _parse_state   = WAIT_HEADER;
-        _is_comm_ok    = true;
-        _is_detected   = false;
+        _resetCache();
         _query_sent    = false;
         _waiting_resp  = false;
         _resp_ok       = false;
-        memset(&_multi_target, 0, sizeof(_multi_target));
 
         _init_time_ms   = millis();
         _last_data_ms   = _init_time_ms;
         _last_query_ms  = 0;
-        _raw_byte_count = 0;
         _raw_byte_total = 0;
         _initialized    = true;
 
@@ -398,20 +404,26 @@ protected:
             portEnd();
             return YOKE_PORT_ERROR_NOT_AVAILABLE;
         }
-        _is_comm_ok = true;
+        {
+            yoke_detail::CacheLock lock(_cache_mutex);
+            _is_comm_ok = true;
+        }
         _last_data_ms = millis();
         return YOKE_PORT_ERROR_NONE;
     }
 
     int portEnd() override {
+        _task.stop();
+        yoke_detail::UartTask::Lock lock(_task);
+        if (!lock) return YOKE_PORT_ERROR_NOT_AVAILABLE;
         if (!_initialized) return YOKE_PORT_ERROR_NOT_INITIALIZED;
         uart_flush(_uart_num);
         uart_wait_tx_done(_uart_num, pdMS_TO_TICKS(100));
-        uart_driver_delete(_uart_num);
+        if (uart_driver_delete(_uart_num) != ESP_OK) return YOKE_PORT_ERROR_NOT_AVAILABLE;
         _initialized  = false;
-        _is_comm_ok   = false;
-        _is_detected  = false;
+        _resetCache();
         _waiting_resp = false;
+        _resp_buf = nullptr;
         return YOKE_PORT_ERROR_NONE;
     }
 
@@ -419,6 +431,59 @@ protected:
     std::string getYokeInfo() override { return "AT6010 mmWave radar via UART on RS PORT"; }
 
 private:
+    static void _taskPoll(void* context) {
+        static_cast<Yoke_rad60*>(context)->_update();
+    }
+
+    // Caller holds the UART mutex, including during synchronous response waits.
+    void _update() {
+        if (!_initialized) return;
+        uint32_t byte_count = 0;
+        uint8_t rx_byte;
+        while (uart_read_bytes(_uart_num, &rx_byte, 1, 0) > 0) {
+            byte_count++;
+            _raw_byte_total++;
+            _processByte(rx_byte);
+        }
+        {
+            yoke_detail::CacheLock lock(_cache_mutex);
+            _raw_byte_count = byte_count;
+        }
+
+        uint32_t now = millis();
+        if (now - _last_data_ms > RAD60_NO_DATA_TIMEOUT_MS) {
+            {
+                yoke_detail::CacheLock lock(_cache_mutex);
+                _is_detected = false;
+                _multi_target.obj_num = 0;
+            }
+            if (!_waiting_resp && !_query_sent && (now - _last_query_ms > RAD60_QUERY_INTERVAL_MS)) {
+                _sendCommand(CMD_GET_RADAR_STATE, nullptr, 0);
+                _last_query_ms = now;
+                _query_sent = true;
+            }
+            if (_query_sent && (now - _last_query_ms > RAD60_COMM_TIMEOUT_MS)) {
+                if (now - _init_time_ms > 5000) {
+                    yoke_detail::CacheLock lock(_cache_mutex);
+                    _is_comm_ok = false;
+                }
+                _query_sent = false;
+            }
+            _last_data_ms = now;
+        }
+    }
+
+    void _resetCache() {
+        yoke_detail::CacheLock lock(_cache_mutex);
+        _is_comm_ok = false;
+        _is_detected = false;
+        _raw_byte_count = 0;
+        memset(&_multi_target, 0, sizeof(_multi_target));
+    }
+
+    yoke_detail::UartTask _task;
+    mutable yoke_detail::CacheMutex _cache_mutex;
+
     // ====================================================================
     //   Hardware
     // ====================================================================
@@ -480,6 +545,8 @@ private:
 
     bool _sendCommandSync(uint8_t cmd, const uint8_t* tx_data, uint8_t tx_len,
                           uint8_t* rx_buf, uint8_t* rx_len, uint32_t timeout_ms) {
+        yoke_detail::UartTask::Lock lock(_task);
+        if (!lock || !_initialized) return false;
         _waiting_resp    = true;
         _wait_cmd        = cmd;
         _resp_buf        = rx_buf;
@@ -492,11 +559,12 @@ private:
         _sendCommand(cmd, tx_data, tx_len);
 
         while (!_resp_ok && (millis() - _resp_start_ms < _resp_timeout_ms)) {
-            update();
+            _update();
             delay(1);
         }
 
         _waiting_resp = false;
+        _resp_buf = nullptr;
         if (_resp_ok && rx_len) {
             *rx_len = _resp_len;
         }
@@ -622,7 +690,7 @@ private:
     }
 
     void _processResponseFrame(uint8_t cmd, uint8_t len, uint8_t* data) {
-        if (_waiting_resp && _wait_cmd == cmd) {
+        if (_waiting_resp && !_resp_ok && _wait_cmd == cmd) {
             if (_resp_buf && data && len > 0) {
                 uint8_t copy_len = (len < _resp_buf_size) ? len : _resp_buf_size;
                 memcpy(_resp_buf, data, copy_len);
@@ -631,7 +699,10 @@ private:
             _resp_ok = true;
         }
         _last_data_ms = millis();
-        _is_comm_ok   = true;
+        {
+            yoke_detail::CacheLock lock(_cache_mutex);
+            _is_comm_ok = true;
+        }
         if (cmd == CMD_GET_RADAR_STATE) {
             _query_sent = false;
         }
@@ -639,7 +710,10 @@ private:
 
     void _processReportFrame(uint8_t len, uint8_t type, uint8_t* data) {
         _last_data_ms = millis();
-        _is_comm_ok   = true;
+        {
+            yoke_detail::CacheLock lock(_cache_mutex);
+            _is_comm_ok = true;
+        }
         _query_sent   = false;
         if (type == 0x0A) {
             _processMultiTargetInfo(len - 1, data);
@@ -664,6 +738,7 @@ private:
         uint8_t obj_num = data[0];
         if (obj_num > 3 || len < 4 + obj_num * 8) return;
 
+        yoke_detail::CacheLock lock(_cache_mutex);
         memset(&_multi_target, 0, sizeof(_multi_target));
         _is_detected = (obj_num > 0);
         if (!_is_detected) return;
@@ -686,7 +761,7 @@ class Yoke_rad60 : public ryzobee_yoke {
 public:
     Yoke_rad60(int uart_num = 0, uint32_t baudrate = 115200)
         : ryzobee_yoke(kRYZOBEE_YOKE_RS, kRS_BUS_UART) {}
-    int begin(std::vector<uint8_t>* iodata, bool apply_defaults = true) {
+    int begin(std::vector<uint8_t>* iodata, bool use_task = true, bool apply_defaults = true) {
         return ryzobee_yoke::begin(iodata);
     }
     void update() {}

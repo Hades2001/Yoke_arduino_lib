@@ -121,6 +121,12 @@ class ryzobee_yoke {
             default: return "UNKNOWN";
         }
     }
+
+    #if defined(CONFIG_IDF_TARGET_ESP32S3)
+
+        // ESP32-S3 专用代码
+        #define CHIP_IS_S3 1
+    #endif
     protected:
         yoke_inferface_type_t _yoke_type;
         rs_bus_type_t _bus_type;
