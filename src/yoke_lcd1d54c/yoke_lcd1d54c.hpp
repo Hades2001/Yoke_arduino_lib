@@ -6,6 +6,7 @@
 
 #include "../ryzobee_yoke.hpp"
 #include "Touch_CST816T.hpp"
+#include "Panel_ST7789V_BOE154.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -263,7 +264,7 @@ private:
             cfg.dummy_read_bits = 1;
             cfg.readable = true;
             cfg.invert = true;
-            cfg.rgb_order = false;
+            cfg.rgb_order = true;
             cfg.dlen_16bit = false;
             cfg.bus_shared = true;
 
@@ -307,7 +308,7 @@ private:
         setPanel(&_panel_instance);
     }
 
-    lgfx::Panel_ST7789 _panel_instance;
+    yoke_detail::Panel_ST7789V_BOE154 _panel_instance;
     lgfx::Bus_SPI _bus_instance;
     lgfx::Light_PWM _light_instance;
     lgfx::Touch_CST816T _touch_instance;
